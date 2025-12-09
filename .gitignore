@@ -1,0 +1,22 @@
+# Environment files (contains secrets)
+.env
+.env.local
+.env.*.local
+
+# Python
+*.pyc
+__pycache__/
+.venv/
+venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+logs/
+*.log
+
+# Docker
+.dockerignore
