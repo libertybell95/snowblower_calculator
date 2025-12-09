@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+# Alert subscriptions (user data)
+alerts.json
+
 # Python
 *.pyc
 __pycache__/

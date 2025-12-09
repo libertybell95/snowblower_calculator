@@ -8,13 +8,15 @@ Uses the SnowblowerAdvisor class to fetch weather data and provide recommendatio
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 import os
 from dotenv import load_dotenv
 from snowblower_advisor import SnowblowerAdvisor
 from typing import Optional
 import logging
 from datetime import datetime
+import json
+from pathlib import Path
 
 # Configure logging
 logging.basicConfig(
@@ -35,6 +37,30 @@ LONGITUDE = float(os.getenv('LONGITUDE', '-96.89542777279159'))
 ACCUMULATION_THRESHOLD = float(os.getenv('ACCUMULATION_THRESHOLD', '2.0'))
 MAX_WIND_SPEED = float(os.getenv('MAX_WIND_SPEED', '25.0'))
 
+# Alert storage file
+ALERTS_FILE = Path('alerts.json')
+
+
+def load_alerts():
+    """Load alert subscriptions from file."""
+    if ALERTS_FILE.exists():
+        try:
+            with open(ALERTS_FILE, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading alerts: {e}")
+            return {}
+    return {}
+
+
+def save_alerts(alerts):
+    """Save alert subscriptions to file."""
+    try:
+        with open(ALERTS_FILE, 'w') as f:
+            json.dump(alerts, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving alerts: {e}")
+
 
 class SnowblowerBot(commands.Bot):
     """Discord bot for snowblowing advice."""
@@ -42,12 +68,17 @@ class SnowblowerBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         super().__init__(command_prefix='/', intents=intents)
+        self.alerts = load_alerts()
+        self.last_alert_state = {}  # Track when we've already alerted
         
     async def setup_hook(self):
         """Called when the bot is starting up."""
         logger.info('Syncing slash commands with Discord...')
         await self.tree.sync()
         logger.info('Slash commands synced successfully')
+        # Start the alert checking task
+        self.check_alerts.start()
+        logger.info('Alert checking task started')
     
     async def on_ready(self):
         """Called when the bot is ready."""
@@ -56,6 +87,58 @@ class SnowblowerBot(commands.Bot):
         for guild in self.guilds:
             logger.info(f'  - {guild.name} (ID: {guild.id}, Members: {guild.member_count})')
         logger.info('Bot is ready to receive commands')
+    
+    @tasks.loop(minutes=15)  # Check every 15 minutes
+    async def check_alerts(self):
+        """Background task to check conditions and send alerts."""
+        try:
+            logger.info('Checking alert conditions...')
+            advice_data = get_advisor_data()
+            
+            # Check if conditions warrant an alert (threshold reached and wind safe)
+            should_alert = advice_data['should_blow'] and advice_data['wind_safe']
+            
+            for alert_key, alert_info in list(self.alerts.items()):
+                channel_id = alert_info['channel_id']
+                user_id = alert_info['user_id']
+                
+                # Create unique key for this alert state
+                state_key = f"{channel_id}_{user_id}"
+                
+                # Only alert if conditions are met and we haven't alerted for this state
+                if should_alert and not self.last_alert_state.get(state_key, False):
+                    try:
+                        channel = self.get_channel(channel_id)
+                        if channel:
+                            user = await self.fetch_user(user_id)
+                            embed = format_snowblower_advice(advice_data)
+                            embed.title = "🚨 SNOWBLOWER ALERT!"
+                            embed.description = f"{user.mention} - Threshold reached!\n\n" + embed.description
+                            
+                            await channel.send(content=user.mention, embed=embed)
+                            logger.info(f'Sent alert to user {user_id} in channel {channel_id}')
+                            
+                            # Mark that we've alerted for this state
+                            self.last_alert_state[state_key] = True
+                        else:
+                            logger.warning(f'Channel {channel_id} not found, removing alert')
+                            del self.alerts[alert_key]
+                            save_alerts(self.alerts)
+                    except Exception as e:
+                        logger.error(f'Error sending alert to {user_id}: {e}')
+                
+                # Reset alert state when conditions no longer met
+                elif not should_alert and self.last_alert_state.get(state_key, False):
+                    self.last_alert_state[state_key] = False
+                    logger.info(f'Alert state reset for {state_key}')
+                    
+        except Exception as e:
+            logger.error(f'Error in alert check task: {e}', exc_info=True)
+    
+    @check_alerts.before_loop
+    async def before_check_alerts(self):
+        """Wait for the bot to be ready before starting the alert loop."""
+        await self.wait_until_ready()
 
 
 # Create bot instance
@@ -302,6 +385,117 @@ async def snowblower_config(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed)
     logger.info(f'Sent configuration info to {user}')
+
+
+@bot.tree.command(name="alert-subscribe", description="Subscribe to snowblower alerts in this channel")
+async def alert_subscribe(interaction: discord.Interaction):
+    """Subscribe to alerts when snowblowing threshold is reached."""
+    user = f"{interaction.user.name}#{interaction.user.discriminator}" if interaction.user.discriminator != '0' else interaction.user.name
+    guild = interaction.guild.name if interaction.guild else "DM"
+    logger.info(f'Command /alert-subscribe invoked by {user} in {guild}')
+    
+    # Create unique key for this subscription
+    alert_key = f"{interaction.channel_id}_{interaction.user.id}"
+    
+    # Check if already subscribed
+    if alert_key in bot.alerts:
+        embed = discord.Embed(
+            title="ℹ️ Already Subscribed",
+            description=f"You're already subscribed to alerts in this channel!\n\nYou'll be notified when:\n• Snow accumulation reaches **{ACCUMULATION_THRESHOLD}\"**\n• Wind conditions are safe (< **{MAX_WIND_SPEED} mph**)",
+            color=discord.Color.blue()
+        )
+    else:
+        # Add subscription
+        bot.alerts[alert_key] = {
+            'channel_id': interaction.channel_id,
+            'user_id': interaction.user.id,
+            'subscribed_at': datetime.now().isoformat()
+        }
+        save_alerts(bot.alerts)
+        
+        embed = discord.Embed(
+            title="✅ Alert Subscription Activated",
+            description=f"{interaction.user.mention} will be notified in this channel when:\n• Snow accumulation reaches **{ACCUMULATION_THRESHOLD}\"**\n• Wind conditions are safe (< **{MAX_WIND_SPEED} mph**)\n\nAlerts are checked every 15 minutes.",
+            color=discord.Color.green()
+        )
+        logger.info(f'User {interaction.user.id} subscribed to alerts in channel {interaction.channel_id}')
+    
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="alert-unsubscribe", description="Unsubscribe from snowblower alerts in this channel")
+async def alert_unsubscribe(interaction: discord.Interaction):
+    """Unsubscribe from alerts in this channel."""
+    user = f"{interaction.user.name}#{interaction.user.discriminator}" if interaction.user.discriminator != '0' else interaction.user.name
+    guild = interaction.guild.name if interaction.guild else "DM"
+    logger.info(f'Command /alert-unsubscribe invoked by {user} in {guild}')
+    
+    # Create unique key for this subscription
+    alert_key = f"{interaction.channel_id}_{interaction.user.id}"
+    
+    # Check if subscribed
+    if alert_key in bot.alerts:
+        del bot.alerts[alert_key]
+        save_alerts(bot.alerts)
+        
+        # Also clear any alert state
+        state_key = f"{interaction.channel_id}_{interaction.user.id}"
+        if state_key in bot.last_alert_state:
+            del bot.last_alert_state[state_key]
+        
+        embed = discord.Embed(
+            title="✅ Unsubscribed",
+            description="You will no longer receive snowblower alerts in this channel.",
+            color=discord.Color.green()
+        )
+        logger.info(f'User {interaction.user.id} unsubscribed from alerts in channel {interaction.channel_id}')
+    else:
+        embed = discord.Embed(
+            title="ℹ️ Not Subscribed",
+            description="You don't have an active alert subscription in this channel.",
+            color=discord.Color.blue()
+        )
+    
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="alert-status", description="Check your alert subscription status")
+async def alert_status(interaction: discord.Interaction):
+    """Check alert subscription status."""
+    user = f"{interaction.user.name}#{interaction.user.discriminator}" if interaction.user.discriminator != '0' else interaction.user.name
+    guild = interaction.guild.name if interaction.guild else "DM"
+    logger.info(f'Command /alert-status invoked by {user} in {guild}')
+    
+    # Find all subscriptions for this user
+    user_alerts = {k: v for k, v in bot.alerts.items() if v['user_id'] == interaction.user.id}
+    
+    if not user_alerts:
+        embed = discord.Embed(
+            title="📋 Alert Status",
+            description="You have no active alert subscriptions.\n\nUse `/alert-subscribe` to get notified when snowblowing conditions are met!",
+            color=discord.Color.blue()
+        )
+    else:
+        embed = discord.Embed(
+            title="📋 Your Alert Subscriptions",
+            description=f"You have **{len(user_alerts)}** active subscription(s):",
+            color=discord.Color.green()
+        )
+        
+        for alert_key, alert_info in user_alerts.items():
+            channel = bot.get_channel(alert_info['channel_id'])
+            channel_name = channel.name if channel else f"Channel ID: {alert_info['channel_id']}"
+            subscribed_at = datetime.fromisoformat(alert_info['subscribed_at']).strftime('%Y-%m-%d %H:%M')
+            
+            embed.add_field(
+                name=f"#{channel_name}",
+                value=f"Subscribed: {subscribed_at}",
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Threshold: {ACCUMULATION_THRESHOLD}\" | Max Wind: {MAX_WIND_SPEED} mph")
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 def main():
