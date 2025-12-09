@@ -1,6 +1,7 @@
 services:
   snowblower-bot:
     build: .
+    pull_policy: build
     container_name: snowblower-discord-bot
     restart: unless-stopped
     environment:
